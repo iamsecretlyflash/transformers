@@ -24,6 +24,7 @@ from . import (
     barthez,
     bartpho,
     beit,
+    bayes_bert,
     bert,
     bert_generation,
     bert_japanese,
