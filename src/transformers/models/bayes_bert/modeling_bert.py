@@ -50,6 +50,7 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_bert import BertConfig
+import torch.functional as F
 
 
 logger = logging.get_logger(__name__)
@@ -446,9 +447,17 @@ class BertIntermediate(nn.Module):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
+        self.expert_variances = nn.Parameter(torch.rand(4))/1000
+        self.expert_weights = nn.Parameter(torch.Tensor([1.0]*4)/4)
+        self.normal_sampler = torch.distributions.normal.Normal(0, 1)
+        
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
+        lol = 0
+        for i in range(4):
+            expert_weight = self.dense.weight + self.normal_sampler.rsample(self.dense.weight.shape)* self.expert_variances[i]
+            lol+=self.expert_weights[i] * (hidden_states@expert_weight.T)
+        hidden_states = lol
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
@@ -459,9 +468,21 @@ class BertOutput(nn.Module):
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.expert_variances = nn.Parameter(torch.rand(4))/1000 
+        self.expert_weights = nn.Parameter(torch.Tensor([1.0]*4)/4)
+        self.normal_sampler = torch.distributions.normal.Normal(0, 1)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
+        ### GMOE Part begins
+        #temp_hidden = []
+        lol = 0
+        for i in range(4):
+            expert_weight = self.dense.weight + self.normal_sampler.rsample(self.dense.weight.shape)* self.expert_variances[i]
+            lol+=self.expert_weights[i] * (hidden_states@expert_weight.T)
+        #hidden_states = sum(temp_hidden)
+        ### GMOE Part ends
+        hidden_states = lol
+        #hidden_states = self.dense(hidden_states) # Original Bert
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -493,6 +514,7 @@ class BertLayer(nn.Module):
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+        #self.variational_loss = 0
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
         self_attention_outputs = self.attention(
             hidden_states,
@@ -544,7 +566,7 @@ class BertLayer(nn.Module):
         # if decoder, return the attn key/values as the last output
         if self.is_decoder:
             outputs = outputs + (present_key_value,)
-
+        #self.variational_loss = self.output.variational_loss
         return outputs
 
     def feed_forward_chunk(self, attention_output):
@@ -559,6 +581,7 @@ class BertEncoder(nn.Module):
         self.config = config
         self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+        #self.variational_loss = 0
 
     def forward(
         self,
@@ -572,7 +595,9 @@ class BertEncoder(nn.Module):
         output_attentions: Optional[bool] = False,
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
+        output_variational_loss: Optional[bool] = False,
     ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPastAndCrossAttentions]:
+        #self.variational_loss = 0
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
@@ -583,7 +608,7 @@ class BertEncoder(nn.Module):
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
                 )
                 use_cache = False
-
+            
         next_decoder_cache = () if use_cache else None
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
@@ -621,9 +646,10 @@ class BertEncoder(nn.Module):
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
-
+            #self.variational_loss += layer_module.variational_loss
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
+        
 
         if not return_dict:
             return tuple(
@@ -637,7 +663,6 @@ class BertEncoder(nn.Module):
                 ]
                 if v is not None
             )
-        #print('ooh la la')
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_decoder_cache,
@@ -885,6 +910,7 @@ class BayesBertModel(BertPreTrainedModel):
         self.encoder = BertEncoder(config)
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
+        #self.variational_loss = 0
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -946,6 +972,7 @@ class BayesBertModel(BertPreTrainedModel):
             `past_key_values`).
         """
         #print('ooh la la')
+        #self.variational_loss = 0
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1025,6 +1052,7 @@ class BayesBertModel(BertPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        #self.variational_loss = self.encoder.variational_loss
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
         #print('ooh la la')
