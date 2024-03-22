@@ -256,8 +256,16 @@ class BertSelfAttention(nn.Module):
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        self.expert_variances_query = nn.Parameter(torch.rand(4))*1e-6
+        self.expert_weights_query = nn.Parameter(torch.Tensor([1.0]*4)/4)
+
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.expert_variances_key = nn.Parameter(torch.rand(4))*1e-6
+        self.expert_weights_key = nn.Parameter(torch.Tensor([1.0]*4)/4)
+        
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.expert_variances_value = nn.Parameter(torch.rand(4))*1e-6
+        self.expert_weights_value = nn.Parameter(torch.Tensor([1.0]*4)/4)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = position_embedding_type or getattr(
@@ -268,6 +276,7 @@ class BertSelfAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
+        self.normal_sampler = torch.distributions.normal.Normal(0, 1)
 
     def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -284,7 +293,12 @@ class BertSelfAttention(nn.Module):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
-        mixed_query_layer = self.query(hidden_states)
+        query_base_rand = self.normal_sampler.rsample(self.query.weight.shape)
+        lol = 0
+        for i in range(4):
+            query_expert_weight = self.query.weight + query_base_rand[torch.randperm(query_base_rand.size()[0])].to(hidden_states.device)* self.expert_variances_query[i]
+            lol+=self.expert_weights_query[i] * (hidden_states@query_expert_weight.T + self.query.bias)
+        mixed_query_layer = lol
 
         # If this is instantiated as a cross-attention module, the keys
         # and values come from an encoder; the attention mask needs to be
@@ -297,17 +311,52 @@ class BertSelfAttention(nn.Module):
             value_layer = past_key_value[1]
             attention_mask = encoder_attention_mask
         elif is_cross_attention:
-            key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
-            value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
+            key_base_rand = self.normal_sampler.rsample(self.key.weight.shape)
+            key_layer_input = 0
+            for i in range(4):
+                key_expert_weight = self.key.weight + key_base_rand[torch.randperm(key_base_rand.size()[0])].to(hidden_states.device)* self.expert_variances_key[i]
+                key_layer_input+=self.expert_weights_key[i] * (hidden_states@key_expert_weight.T + self.key.bias)
+            key_layer = self.transpose_for_scores(key_layer_input)
+
+            value_base_rand = self.normal_sampler.rsample(self.value.weight.shape)
+            value_layer_input = 0
+            for i in range(4):
+                value_expert_weight = self.value.weight + value_base_rand[torch.randperm(value_base_rand.size()[0])].to(hidden_states.device)* self.expert_variances_value[i]
+                value_layer_input += self.expert_weights_value[i] * (hidden_states@value_expert_weight.T+ self.value.bias)
+            value_layer = self.transpose_for_scores(value_layer_input)
             attention_mask = encoder_attention_mask
+
         elif past_key_value is not None:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
+            key_base_rand = self.normal_sampler.rsample(self.key.weight.shape)
+            key_layer_input = 0
+            for i in range(4):
+                key_expert_weight = self.key.weight + key_base_rand[torch.randperm(key_base_rand.size()[0])].to(hidden_states.device)* self.expert_variances_key[i]
+                key_layer_input+=self.expert_weights_key[i] * (hidden_states@key_expert_weight.T + self.key.bias )
+            key_layer = self.transpose_for_scores(key_layer_input)
+
+            value_base_rand = self.normal_sampler.rsample(self.value.weight.shape)
+            value_layer_input = 0
+            for i in range(4):
+                value_expert_weight = self.value.weight + value_base_rand[torch.randperm(value_base_rand.size()[0])].to(hidden_states.device)* self.expert_variances_value[i]
+                value_layer_input += self.expert_weights_value[i] * (hidden_states@value_expert_weight.T + self.value.bias)
+            value_layer = self.transpose_for_scores(value_layer_input)
+
             key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
             value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
         else:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
+            key_base_rand = self.normal_sampler.rsample(self.key.weight.shape)
+            key_layer_input = 0
+            for i in range(4):
+                key_expert_weight = self.key.weight + key_base_rand[torch.randperm(key_base_rand.size()[0])].to(hidden_states.device)* self.expert_variances_key[i]
+                key_layer_input+=self.expert_weights_key[i] * (hidden_states@key_expert_weight.T + self.key.bias)
+            key_layer = self.transpose_for_scores(key_layer_input)
+
+            value_base_rand = self.normal_sampler.rsample(self.value.weight.shape)
+            value_layer_input = 0
+            for i in range(4):
+                value_expert_weight = self.value.weight + value_base_rand[torch.randperm(value_base_rand.size()[0])].to(hidden_states.device)* self.expert_variances_value[i]
+                value_layer_input += self.expert_weights_value[i] * (hidden_states@value_expert_weight.T + self.value.bias)
+            value_layer = self.transpose_for_scores(value_layer_input)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
@@ -382,8 +431,17 @@ class BertSelfOutput(nn.Module):
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        # self.expert_variances = nn.Parameter(torch.rand(4))*1e-6
+        # self.expert_weights = nn.Parameter(torch.Tensor([1.0]*4)/4)
+        # self.normal_sampler = torch.distributions.normal.Normal(0, 1)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+        # lol = 0
+        # first_perm = self.normal_sampler.rsample(self.dense.weight.shape)
+        # for i in range(4):
+        #     expert_weight = self.dense.weight + first_perm[torch.randperm(first_perm.size()[0])].to(hidden_states.device)* self.expert_variances[i]
+        #     lol+=self.expert_weights[i] * (hidden_states@expert_weight.T + self.dense.bias)
+        # hidden_states = lol
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
@@ -447,17 +505,19 @@ class BertIntermediate(nn.Module):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
-        self.expert_variances = nn.Parameter(torch.rand(4))/1000
-        self.expert_weights = nn.Parameter(torch.Tensor([1.0]*4)/4)
-        self.normal_sampler = torch.distributions.normal.Normal(0, 1)
+        # self.expert_variances = nn.Parameter(torch.rand(4))*1e-6
+        # self.expert_weights = nn.Parameter(torch.Tensor([1.0]*4)/4)
+        # self.normal_sampler = torch.distributions.normal.Normal(0, 1)
         
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        lol = 0
-        for i in range(4):
-            expert_weight = self.dense.weight + self.normal_sampler.rsample(self.dense.weight.shape)* self.expert_variances[i]
-            lol+=self.expert_weights[i] * (hidden_states@expert_weight.T)
-        hidden_states = lol
+        # lol = 0
+        # first_perm = self.normal_sampler.rsample(self.dense.weight.shape)
+        # for i in range(4):
+        #     expert_weight = self.dense.weight + first_perm[torch.randperm(first_perm.size()[0])].to(hidden_states.device)* self.expert_variances[i]
+        #     lol+=self.expert_weights[i] * (hidden_states@expert_weight.T)
+        # hidden_states = lol
+        hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
@@ -468,21 +528,22 @@ class BertOutput(nn.Module):
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.expert_variances = nn.Parameter(torch.rand(4))/1000 
-        self.expert_weights = nn.Parameter(torch.Tensor([1.0]*4)/4)
-        self.normal_sampler = torch.distributions.normal.Normal(0, 1)
+        # self.expert_variances = nn.Parameter(torch.rand(4))*1e-6
+        # self.expert_weights = nn.Parameter(torch.Tensor([1.0]*4)/4)
+        # self.normal_sampler = torch.distributions.normal.Normal(0, 1)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         ### GMOE Part begins
         #temp_hidden = []
-        lol = 0
-        for i in range(4):
-            expert_weight = self.dense.weight + self.normal_sampler.rsample(self.dense.weight.shape)* self.expert_variances[i]
-            lol+=self.expert_weights[i] * (hidden_states@expert_weight.T)
-        #hidden_states = sum(temp_hidden)
-        ### GMOE Part ends
-        hidden_states = lol
-        #hidden_states = self.dense(hidden_states) # Original Bert
+        # lol = 0
+        # first_perm = self.normal_sampler.rsample(self.dense.weight.shape)
+        # for i in range(4):
+        #     expert_weight = self.dense.weight + first_perm[torch.randperm(first_perm.size()[0])].to(hidden_states.device)* self.expert_variances[i]
+        #     lol+=self.expert_weights[i] * (hidden_states@expert_weight.T)
+        # #hidden_states = sum(temp_hidden)
+        # ### GMOE Part ends
+        # hidden_states = lol
+        hidden_states = self.dense(hidden_states) # Original Bert
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
